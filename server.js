@@ -1602,3 +1602,6 @@ app.get('/fix-embeddings', async (req, res) => {
     res.status(500).send(`Ошибка: ${e.message}`);
   }
 });
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Сервер запущен: http://localhost:${PORT}`);
+});
