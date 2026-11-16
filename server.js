@@ -1570,21 +1570,25 @@ app.get('/health', (req, res) => {
 });
 app.get('/fix-embeddings', async (req, res) => {
   try {
-    // 1. Берем все строки ПинАпа, у которых вектор нулевой
     const r = await fetch(`${COMMON_SUPABASE_URL}/rest/v1/documents?client_id=eq.${CLIENT_ID}&select=id,content,embedding`, {
       headers: { 'apikey': COMMON_SUPABASE_KEY, 'Authorization': `Bearer ${COMMON_SUPABASE_KEY}` }
     });
     const docs = await r.json();
     let fixed = 0;
 
-    // 2. Проходимся по каждой
     for (const doc of docs) {
-      // Проверяем, если вектор пустой или из нулей
-      if (!doc.embedding || doc.embedding.every(v => v === 0)) {
-        // 3. Генерируем вектор через OpenRouter (твоя функция getEmbedding)
+      // Проверяем, если вектор пустой или строка из нулей
+      let isZero = false;
+      if (!doc.embedding) {
+        isZero = true;
+      } else if (typeof doc.embedding === 'string' && doc.embedding.startsWith('[0,0,0')) {
+        isZero = true;
+      } else if (Array.isArray(doc.embedding) && doc.embedding.every(v => v === 0)) {
+        isZero = true;
+      }
+
+      if (isZero) {
         const emb = await getEmbedding(doc.content);
-        
-        // 4. Обновляем строку в базе
         await fetch(`${COMMON_SUPABASE_URL}/rest/v1/documents?id=eq.${doc.id}`, {
           method: 'PATCH',
           headers: { 'apikey': COMMON_SUPABASE_KEY, 'Authorization': `Bearer ${COMMON_SUPABASE_KEY}`, 'Content-Type': 'application/json' },
@@ -1597,7 +1601,4 @@ app.get('/fix-embeddings', async (req, res) => {
   } catch (e) {
     res.status(500).send(`Ошибка: ${e.message}`);
   }
-});
-app.listen(PORT, () => {
-  console.log(`Сервер запущен: http://localhost:${PORT}`);
 });
