@@ -547,7 +547,7 @@ ${context || 'Информация временно недоступна.'}`;
   }
   
     
-  if (lowerMsg.includes('ссылка') || lowerMsg.includes('сайт') || lowerMsg.includes('адрес')) {
+  if (lowerMsg.includes('ссылка') || lowerMsg.includes('сайт')) {
     reply = `Наш официальный сайт: ${BASE_URL}\n\nТам вы можете посмотреть тарифы, примеры работ и оставить заявку.`;
   }
  
