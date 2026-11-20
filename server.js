@@ -14,6 +14,7 @@ app.use(cors());
 app.use(express.json({ limit: '25mb' }));
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '';
+
 const crypto = require('crypto');
 const ADMIN_TG_ID = '5818548555';
 
@@ -91,25 +92,10 @@ app.use('/message', (req, res, next) => {
   next();
 });
 
-// Проверка авторизации для служебных API (данные клиентов)
-app.use((req, res, next) => {
-  const guarded = req.path === '/api/get-leads' || req.path === '/api/get-my-client' || req.path === '/api/lead-update';
-  if (!guarded) return next();
+app.get('/api/auth-token', (req, res) => {
   const uid = getRequesterId(req);
   if (!uid) return res.status(401).json({ error: 'unauthorized' });
-  req.requesterId = uid;
-  next();
-});
-
-// Доступ только к своим клиентам (админ видит всех)
-app.use(async (req, res, next) => {
-  try {
-    if (req.path !== '/api/get-leads' || !req.requesterId) return next();
-    const allowed = await ownedClientIds(req.requesterId);
-    const cid = req.query.client_id;
-    if (allowed && (!cid || !allowed.includes(cid))) return res.status(403).json({ error: 'forbidden' });
-    next();
-  } catch (e) { next(); }
+  res.json({ token: signAuth(uid) });
 });
 
 const MANAGER_CHAT_ID = process.env.MANAGER_CHAT_ID || '';
@@ -121,7 +107,7 @@ const COMMON_SUPABASE_KEY = process.env.COMMON_SUPABASE_KEY || process.env.SUPAB
 const OPENROUTER_KEY = process.env.OPENROUTER_KEY || '';
 const FIRECRAWL_KEY = process.env.FIRECRAWL_KEY || '';
 const SITE_TO_CRAWL = 'https://mypinup.pro/';
-const BUSINESS_NAME = 'PinUP2';
+const BUSINESS_NAME = "PinUP2";
 const CLIENT_ID = 'PinUP2';
 const PRICE_PER_LEAD = Number(process.env.PRICE_PER_LEAD) || 25;
 const BASE_URL = 'https://mypinup.pro/';
@@ -133,6 +119,57 @@ const AI_MODEL_VOICE = process.env.AI_MODEL_VOICE || 'openai/whisper-large-v3';
 const YOOKASSA_SHOP_ID = process.env.YOOKASSA_SHOP_ID || '';
 const YOOKASSA_SECRET_KEY = process.env.YOOKASSA_SECRET_KEY || '';
 const YOOKASSA_RETURN_URL = process.env.YOOKASSA_RETURN_URL || 'https://t.me/vadim602_bot';
+
+
+// Филиалы клиента (JSON-массив в env BRANCHES), используются для кнопок выбора
+const BRANCHES = (() => {
+  try {
+    const raw = process.env.BRANCHES || '';
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr.filter(x => typeof x === 'string' && x.trim()) : [];
+  } catch (e) { return []; }
+})();
+
+
+const BRANCHES_GEO = (() => {
+  try {
+    const arr = JSON.parse(process.env.BRANCHES_GEO || '[]');
+    return Array.isArray(arr) ? arr.filter(x => x && x.lat && x.lon) : [];
+  } catch (e) { return []; }
+})();
+
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+function nearestBranch(lat, lon) {
+  let best = null;
+  for (const b of BRANCHES_GEO) {
+    const d = haversine(lat, lon, b.lat, b.lon);
+    if (!best || d < best.dist) best = { addr: b.addr, dist: d };
+  }
+  return best;
+}
+
+async function sendLocationKeyboard(chatId) {
+  await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: 'Или отправьте геолокацию — найду ближайший филиал.',
+      reply_markup: {
+        keyboard: [[{ text: '📍 Отправить геолокацию', request_location: true }]],
+        resize_keyboard: true,
+        one_time_keyboard: true
+      }
+    })
+  });
+}
 
 const TARIFFS = {
   'start': { 
@@ -159,7 +196,7 @@ const TARIFFS = {
 
 const processedUpdates = new Set();
 const newClientStates = {}; // Память для пошагового создания
-const BUSINESS_PROMPT = "Ты — администратор салона красоты PinUP (mypinup.pro), Новокузнецк. Общайся как живой администратор салона: приветливо, коротко, по делу.";
+const BUSINESS_PROMPT = process.env.BUSINESS_PROMPT || 'Ты — AI-Администратор компании «' + BUSINESS_NAME + '». Опытный, живой менеджер по продажам: общаешься с клиентами на сайте и в Telegram, коротко и по делу.';
 
 // ========== КЛИЕНТЫ И ОПЛАТА ==========
 
@@ -480,7 +517,9 @@ function cleanReply(text) {
     .replace(/\*\*(.*?)\*\*/g, '$1').replace(/\*(.*?)\*/g, '$1').replace(/__(.*?)__/g, '$1').replace(/_(.*?)_/g, '$1')
     .replace(/^#{1,6}\s+/gm, '').replace(/`/g, '')
     .replace(/^\s*[-•]\s+/gm, '')
-    .replace(/\n{3,}/g, '\n\n').trim();
+    .replace(/\n{3,}/g, '\n\n')
+    .split('\n').map(l => l.trim()).filter(l => l.length).join('\n')
+    .trim();
 }
 
 async function notifyManager(lead, leadId) {
@@ -580,28 +619,74 @@ async function askAI(message, history, sessionId) {
     // Идентичность клиента + правила + БАЗА ЗНАНИЙ. Контекст подставляется ВСЕГДА,
     // даже если промпт задан в БД, иначе бот отвечает без базы знаний и выдумывает факты.
     const identityPrompt = (clientConfig?.prompt || BUSINESS_PROMPT || '').trim();
-    const systemPrompt = `${identityPrompt ? identityPrompt + '\n\n' : ''}СЕГОДНЯШНЯЯ ДАТА И ВРЕМЯ: ${currentDate}.
-Ты — AI-Администратор компании «${BUSINESS_NAME}». Твоя цель — помочь клиенту и мягко подвести к записи.
+    const isSaasBot = CLIENT_ID === 'tilda';
+    const saasBlock = `Ты — AI-Администратор компании «${BUSINESS_NAME}». Ты опытный, живой менеджер по продажам, который общается с клиентами на сайте и в Telegram. Твоя цель — продать услугу, собрать заявку и мягко работать с возражениями.
+1. Ты — живой человек, а не робот. Общайся максимально естественно, как в обычном чате. Используй слова вроде «Отлично», «Понял», «Да, это решаемо».
+2. Отвечай ОЧЕНЬ коротко: строго 2-3 предложения. Никаких длинных текстов и простыней.
+3. НЕ используй списки, тире, нумерацию, звёздочки. Только обычный текст.
+4. Не повторяй вопрос клиента. Не используй шаблонные фразы.
+5. Задавай ОДИН наводящий вопрос за раз, чтобы поддерживать диалог.
+6. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО повторять один и тот же оффер в каждом сообщении. Предлагай подключиться только тогда, когда клиент сам проявит интерес. Не дави на него.
+7. НИКОГДА не пиши маркеры [LEAD_SAVE] в обычных сообщениях.
 
-ПРАВИЛА ОБЩЕНИЯ:
-1. Ты — живой человек. Общайся естественно, с эмпатией. Если клиент недоволен — сначала посочувствуй, потом решай проблему.
-2. Отвечай ОЧЕНЬ коротко: строго 1-2 предложения.
-3. Помни историю диалога. Не задавай вопросы, на которые тебе уже ответили.
-4. НЕ ПРОСИ имя и телефон в каждом сообщении. Предложи оставить контакт только тогда, когда клиент сам проявил интерес (спросил «как записаться», «хочу»).
+УМНАЯ НАВИГАЦИЯ ПО САЙТУ:
+Если клиент спрашивает про цены/тарифы — в ответе ОБЯЗАТЕЛЬНО добавь тег [SCROLL:tariffs]. 
+Если клиент спрашивает "как это работает" — добавь [SCROLL:how].
+Если клиент просит показать примеры/демо — добавь [SCROLL:demos].
+Если клиент спрашивает про гарантии — добавь [SCROLL:guarantee].
+Если спрашивает "почему вы" или "почему я" — добавь [SCROLL:why-me].
+Если спрашивает "кому подходит" или про сферы бизнеса — добавь [SCROLL:for-whom].
+Если просит оферту или договор — добавь [SCROLL:oferta].
+Если просит отзывы — добавь [SCROLL:reviews].
 
-ЖЕЛЕЗНЫЕ ФАКТЫ (ЗАПРЕЩЕНО ВЫДУМЫВАТЬ):
-- Ты знаешь ТОЛЬКО то, что написано в "БАЗЕ ЗНАНИЙ" ниже.
-- Если клиент спрашивает адрес, телефон, цены или услуги — ищи их ТОЛЬКО в базе знаний.
-- Если этого нет в базе знаний — честно скажи: «Уточню у администратора» и предложи оставить номер.
-- НИКАКИХ выдуманных городов, цен или телефонов. 
+ТВОИ ЗНАНИЯ О ПРОДУКТЕ:
+- Бот работает 24/7, отвечает мгновенно.
+- Понимает голосовые сообщения.
+- Собирает заявки (имя, телефон, запрос).
+- Работает как CRM: все заявки в одном месте, группировка, выгрузка в Excel и на почту.
+- Первая неделя и настройка ВСЕГДА бесплатно.
+- Отключить можно в любой момент (без штрафов).
+
+ТАРИФЫ И ЦЕНЫ (ЗНАЙ ИХ НАИЗУСТЬ):
+1. Тариф «Старт» — ${TARIFFS.start.amountMonth} ₽/мес (до 100 заявок, свыше — ${PRICE_PER_LEAD} ₽/заявка). При годовой оплате — ${TARIFFS.start.amountYear} ₽/год.
+2. Тариф «Бизнес» — ${TARIFFS.business.amountMonth} ₽/мес (до 300 заявок, свыше — ${PRICE_PER_LEAD} ₽/заявка). При годовой оплате — ${TARIFFS.business.amountYear} ₽/год.
+3. Тариф «Безлимит» — ${TARIFFS.unlimited.amountMonth} ₽/мес (без ограничений). При годовой оплате — ${TARIFFS.unlimited.amountYear} ₽/год.
+4. Тариф «За результат» — ${PRICE_PER_LEAD} ₽ за заявку (платит в конце месяца).
+
+ПРАВИЛА ПРОДАЖ (ВОРОНКА):
+1. Поздоровайся и спроси, чем занимается бизнес.
+2. Уточни боль: теряются ли заявки?
+3. Покажи выгоду.
+4. Если спрашивают цену — озвучь ВСЕ 4 ТАРИФА кратко.
+5. Обязательно подчеркни: "Настройка и первая неделя бесплатно" (но только если уместно!).
+6. Призыв к действию: не проси контакты сразу. Сначала ответь на вопрос и помоги. Предложи оставить имя и телефон только тогда, когда клиент готов к следующему шагу (сам спросил «как записаться», «хочу подключить», уточняет детали или сомневается).
 
 СБОР ЗАЯВКИ:
-Когда клиент четко назвал имя И телефон — добавь в САМОМ КОНЦЕ ответа строку ровно такого вида, подставив РЕАЛЬНЫЕ данные клиента:
-[LEAD_SAVE][NAME:Иван][PHONE:+79001234567][PROBLEM:краткая суть вопроса]
+Когда клиент назвал имя + телефон — добавь в САМОМ КОНЦЕ ответа строку ровно такого вида, подставив РЕАЛЬНЫЕ данные клиента:
+[LEAD_SAVE][NAME:Иван][PHONE:+79001234567][PROBLEM:краткая суть]
 Никогда не выводи вместо значений слова «имя», «телефон», «суть» или угловые скобки.
 
-БАЗА ЗНАНИЙ:
-${context || 'Информация временно недоступна.'}`;
+КОНТЕКСТ ДИАЛОГА:
+Если ты видишь, что диалог начался на сайте (в истории есть предыдущие сообщения), не начинай разговор с нуля. Продолжай его по смыслу. Например: "Возвращаясь к вашему вопросу про тарифы..." или "Как я понял, вас интересует...".
+`;
+    const clientBlock = `Ты — AI-Администратор компании «${BUSINESS_NAME}». Твоя задача — консультировать клиентов по услугам и товарам компании и собирать заявки.
+
+ГЛАВНОЕ ПРАВИЛО: все факты (адрес, телефон, цены, услуги, график) бери ТОЛЬКО из блока «БАЗА ЗНАНИЙ» ниже. Не используй свои общие знания о компаниях и городах. Если факта в базе нет — скажи: «Уточню у администратора» и предложи оставить имя и телефон.
+
+ПРАВИЛА:
+1. Ты — живой человек. Общайся естественно, с эмпатией, без канцелярита.
+2. Отвечай коротко: 1-2 предложения.
+3. Помни историю диалога, не задавай вопросы, на которые уже ответили.
+4. Не используй списки, тире, звёздочки и markdown.
+5. Если спрашивают адрес, телефон, цены или график — найди эту строку в «БАЗЕ ЗНАНИЙ» и передай её смысл дословно, ничего не добавляя от себя.
+6. Категорически запрещено называть адрес, телефон или цену, которых нет в «БАЗЕ ЗНАНИЙ», даже если ты «знаешь» эту компанию.
+7. Имя и телефон проси только тогда, когда клиент сам проявил интерес (спросил цену, «хочу», «запишите»).
+
+СБОР ЗАЯВКИ:
+Когда клиент назвал имя И телефон — добавь в САМОМ КОНЦЕ ответа строку ровно такого вида, подставив РЕАЛЬНЫЕ данные:
+[LEAD_SAVE][NAME:Иван][PHONE:+79001234567][PROBLEM:краткая суть]
+Никогда не выводи вместо значений слова «имя», «телефон», «суть» или угловые скобки.`;
+    const systemPrompt = `${identityPrompt ? identityPrompt + '\n\n' : ''}СЕГОДНЯШНЯЯ ДАТА И ВРЕМЯ: ${currentDate}.\n\n${isSaasBot ? saasBlock : clientBlock}\n\nБАЗА ЗНАНИЙ:\n{context || 'Информация временно недоступна.'}`;
 
         const limitPrompt = `СЕГОДНЯШНЯЯ ДАТА И ВРЕМЯ: ${currentDate}.\n\n` + systemPrompt + `
 
@@ -620,22 +705,85 @@ ${context || 'Информация временно недоступна.'}`;
   const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${OPENROUTER_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: AI_MODEL_CHAT, messages, temperature: 0.6, max_tokens: 150 })
+    body: JSON.stringify({ model: AI_MODEL_CHAT, messages, temperature: CLIENT_ID === 'tilda' ? 0.6 : 0.2, max_tokens: 150 })
   });
   const data = await r.json();
   if (!r.ok) throw new Error('OpenRouter error');
   let reply = data.choices?.[0]?.message?.content || 'Нет ответа';
 
+  // Защита от выдуманных фактов: если в ответе про адрес/телефон есть цифры или слова,
+  // которых нет в базе знаний — значит модель сочинила. Отвечаем безопасно.
+  if (CLIENT_ID !== 'tilda') {
+    const asksContact = /адрес|где\s|где вы|где находит|добрат|телефон|позвон|контакт/i.test(message || '');
+    if (asksContact) {
+      const ctx = (context || '').toLowerCase();
+      const ctxDigits = (ctx.match(/\d+/g) || []).join(' ');
+      const replyDigits = (reply.match(/\d{3,}/g) || []);
+      const badDigits = replyDigits.filter(d => !ctxDigits.includes(d));
+      const streetWords = ['проспект', 'улица', 'ул.', 'переулок', 'бульвар', 'трц', 'этаж', 'д.'];
+      const badStreet = streetWords.some(w => reply.toLowerCase().includes(w) && !ctx.includes(w));
+      const saysNo = /не указан|недоступ|не знаю|не могу предостав|уточн(ю|ить)/i.test(reply);
+      const addressAsked = /адрес|где\s|где вы|где находит|добрат|филиал/i.test(message || '');
+      if (badDigits.length > 0 || badStreet || (saysNo && addressAsked && ctx.length > 50)) {
+        console.log('⚠️ выдуманные контакты, ответ заменён:', reply.slice(0, 80));
+        // Отвечаем фактом из базы знаний, а не отказом
+        const wantsPhone = /телефон|позвон|номер/i.test(message || '');
+        let grounded = '';
+        if (wantsPhone) {
+          const m = (context || '').match(/\+?7[\d\s\-()]{9,}/);
+          if (m) grounded = 'Наш телефон: ' + m[0].trim().replace(/[^\d+]+$/, '');
+        }
+        if (!grounded) {
+          const src = (context || '');
+          let ci = src.search(/Адреса филиалов/i);
+          if (ci < 0) ci = src.search(/филиал/i);
+          if (ci < 0) ci = src.search(/адрес/i);
+          if (ci >= 0) {
+            let slice = src.slice(ci, ci + 900).replace(/\s+/g, ' ').trim();
+            slice = slice
+              .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+              .replace(/https?:\/\/\S+/g, '')
+              .replace(/[×←→©]/g, '')
+              .replace(/\s{2,}/g, ' ')
+              .split('---')[0]
+              .trim();
+            const cut = slice.lastIndexOf(';');
+            if (slice.length >= 880 && cut > 200) slice = slice.slice(0, cut + 1);
+            grounded = 'Наши филиалы: ' + slice;
+          }
+        }
+        reply = grounded || 'Уточню точный адрес и телефон у администратора. Оставьте, пожалуйста, имя и номер — мы свяжемся и всё расскажем.';
+      }
+    }
+  }
+
   const lowerMsg = message.toLowerCase();
   
-      
+  // Сайтовые ответы (тарифы, демо, оферта) — только для бота-витрины.
+  if (CLIENT_ID === 'tilda') {
+    if (lowerMsg.includes('тариф') || lowerMsg.includes('цен') || lowerMsg.includes('стоимост') || lowerMsg.includes('подробн')) {
+    reply = `Есть 4 тарифа:
+    
+1. <b>Старт</b> — ${TARIFFS.start.amountMonth} ₽/мес (до 100 заявок)
+2. <b>Бизнес</b> — ${TARIFFS.business.amountMonth} ₽/мес (до 300 заявок)
+3. <b>Безлимит</b> — ${TARIFFS.unlimited.amountMonth} ₽/мес (без ограничений)
+4. <b>За результат</b> — ${PRICE_PER_LEAD} ₽ за заявку
+
+Первая неделя и настройка бесплатно. Какой объём заявок у вас обычно?
+
+Посмотреть тарифы: ${BASE_URL}/?go=tariffs`;
+  }
+  
   if (lowerMsg.includes('как работает') || lowerMsg.includes('как это работает')) {
     if (!reply.includes('[SCROLL:')) reply += ' [SCROLL:how]';
     if (!reply.includes(BASE_URL)) reply += `\n\nКак это работает: ${BASE_URL}/?go=how`;
   }
   
-    
-  if (lowerMsg.includes('ссылка') || lowerMsg.includes('сайт')) {
+    if (lowerMsg.includes('пример') || lowerMsg.includes('демо') || lowerMsg.includes('покажи')) {
+    reply = `Вы можете посмотреть живые примеры работы бота на нашем сайте. Там есть 4 демо-сайта: салон красоты, стоматология, автосервис и магазин запчастей.\n\nПосмотреть их можно здесь: ${BASE_URL}/?go=demos\nНажмите на любую карточку и протестируйте бота в действии.`;
+  }
+
+  if (lowerMsg.includes('ссылка') || lowerMsg.includes('сайт') || lowerMsg.includes('адрес')) {
     reply = `Наш официальный сайт: ${BASE_URL}\n\nТам вы можете посмотреть тарифы, примеры работ и оставить заявку.`;
   }
  
@@ -672,6 +820,7 @@ ${context || 'Информация временно недоступна.'}`;
   if (lowerMsg.includes('отзыв')) {
     if (!reply.includes('[SCROLL:')) reply += ' [SCROLL:reviews]';
     if (!reply.includes(BASE_URL)) reply += `\n\nОтзывы клиентов: ${BASE_URL}/?go=reviews`;
+  }
   }
 
   const leadData = extractLeadData(reply); 
@@ -777,7 +926,12 @@ app.get('/app', (req, res) => {
 });
 app.get('/api/get-my-client', async (req, res) => {
   try {
+    const uid = getRequesterId(req);
+    if (!uid) return res.status(401).json({ error: 'unauthorized' });
     const { owner_telegram_id } = req.query;
+    if (String(owner_telegram_id || uid) !== String(uid) && String(uid) !== ADMIN_TG_ID) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
     const url = `${COMMON_SUPABASE_URL}/rest/v1/clients?select=*&owner_telegram_id=eq.${owner_telegram_id}&client_id=eq.${CLIENT_ID}&limit=1`;
     const r = await fetch(url, {
       headers: { 'apikey': COMMON_SUPABASE_KEY, 'Authorization': `Bearer ${COMMON_SUPABASE_KEY}` }
@@ -790,7 +944,13 @@ app.get('/api/get-my-client', async (req, res) => {
 });
 app.get('/api/get-leads', async (req, res) => {
   try {
+    const uid = getRequesterId(req);
+    if (!uid) return res.status(401).json({ error: 'unauthorized' });
     const { client_id } = req.query;
+    const allowed = await ownedClientIds(uid);
+    if (allowed && (!client_id || !allowed.includes(client_id))) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
     const isTilda = client_id === 'tilda';
     const baseUrl = isTilda ? SUPABASE_URL : COMMON_SUPABASE_URL;
     const baseKey = isTilda ? SUPABASE_KEY : COMMON_SUPABASE_KEY;
@@ -900,7 +1060,97 @@ app.post('/telegram-webhook', async (req, res) => {
       const messageId = cb.message.message_id;
       const data = cb.data;
 
+      // Выбор филиала клиентом (кнопки в его чате)
+      if (String(data).startsWith('br_')) {
+        const idx = Number(String(data).slice(3));
+        const addr = BRANCHES[idx];
+        if (!addr) { await answerCallback(cb.id, 'Не найдено'); return; }
+        await answerCallback(cb.id, addr);
+        await sendTelegram(chatId, 'Вы выбрали филиал: <b>' + addr + '</b>\n\nОн находится по этому адресу. Хотите записаться?');
+        try {
+          const sess = await getSessionByTelegram(chatId);
+          if (sess) {
+            const h = sess.history || [];
+            h.push({ role: 'user', content: 'Выбрал филиал: ' + addr });
+            await updateSession(sess.session_id, { history: h.slice(-20), branch: addr });
+          }
+        } catch (e) {}
+        return;
+      }
+
       if (String(chatId) !== String(MANAGER_CHAT_ID)) { await answerCallback(cb.id, 'Нет доступа'); return; }
+
+
+      // --- Запись на время, услуги, отзывы, менеджер ---
+      if (String(data).startsWith('bf_')) {
+        const addr = BRANCHES[Number(String(data).slice(3))];
+        if (!addr) { await answerCallback(cb.id, 'Не найдено'); return; }
+        await answerCallback(cb.id, addr);
+        const s = await getSessionByTelegram(chatId);
+        if (s) await updateSession(s.session_id, { branch: addr, service: null });
+        await showServices(chatId);
+        return;
+      }
+
+      if (String(data).startsWith('bs_')) {
+        const idx = String(data).slice(3);
+        const svc = idx === 'x' ? null : SERVICES[Number(idx)];
+        const s = await getSessionByTelegram(chatId);
+        if (s) await updateSession(s.session_id, { service: svc ? svc.name : null });
+        await answerCallback(cb.id, svc ? svc.name : 'ок');
+        await showSlots(chatId);
+        return;
+      }
+
+      if (String(data).startsWith('bk_')) {
+        const ts = Number(String(data).slice(3));
+        if (!ts) { await answerCallback(cb.id, 'Не понял время'); return; }
+        await answerCallback(cb.id, 'Записываю...');
+        await confirmBooking(chatId, ts);
+        return;
+      }
+
+      if (String(data).startsWith('rev_')) {
+        const parts = String(data).split('_');
+        const rate = Number(parts[1]);
+        const bid = parts[2];
+        if (bid) await sbUpdateBooking(bid, { rating: rate });
+        await answerCallback(cb.id, 'Спасибо!');
+        const thanks = rate >= 4
+          ? 'Спасибо за высокую оценку! Будем рады видеть вас снова 💚'
+          : 'Спасибо за отзыв. Подскажите, что можно улучшить? Мы передадим администратору.';
+        await sendTelegram(chatId, thanks);
+        if (rate <= 3 && MANAGER_CHAT_ID) {
+          await sendTelegram(MANAGER_CHAT_ID, '⚠️ Низкая оценка визита: ' + rate + '/5. Стоит связаться с клиентом.');
+        }
+        return;
+      }
+
+      if (data === 'agn') {
+        await answerCallback(cb.id, 'Повторяем');
+        await repeatLastBooking(chatId);
+        return;
+      }
+
+      if (data === 'new') {
+        await answerCallback(cb.id, 'Ок');
+        await showServices(chatId);
+        return;
+      }
+
+      if (data === 'mgr') {
+        await answerCallback(cb.id, 'Передал администратору');
+        await sendTelegram(chatId, 'Передал администратору — он ответит в ближайшее время.');
+        if (MANAGER_CHAT_ID) await sendTelegram(MANAGER_CHAT_ID, '👤 Клиент просит связаться с администратором (чат ' + chatId + ').');
+        return;
+      }
+
+      if (data === 'cb_call') {
+        await answerCallback(cb.id, 'Записал');
+        await sendTelegram(chatId, 'Хорошо, администратор перезвонит. Если удобно — напишите номер здесь.');
+        if (MANAGER_CHAT_ID) await sendTelegram(MANAGER_CHAT_ID, '📞 Клиент просит перезвонить (чат ' + chatId + ').');
+        return;
+      }
 
       if (data === 'menu_bill') {
         const billText = `<b>Наши тарифы:</b>\n\n` +
@@ -991,6 +1241,24 @@ app.post('/telegram-webhook', async (req, res) => {
     const chatId = msg.chat.id;
     let text = '';
 
+    if (msg.location && BRANCHES_GEO.length) {
+      const near = nearestBranch(msg.location.latitude, msg.location.longitude);
+      if (near) {
+        await sendTelegram(chatId, 'Ближе всего к вам: <b>' + near.addr + '</b> — примерно ' + near.dist.toFixed(1) + ' км. Записать вас туда?');
+        try {
+          let sess = await getSessionByTelegram(chatId);
+          if (!sess) {
+            const sid = 'tg_' + chatId + '_' + CLIENT_ID;
+            await getOrCreateSession(sid);
+            await updateSession(sid, { telegram_chat_id: chatId });
+            sess = await getSessionByTelegram(chatId);
+          }
+          if (sess) await updateSession(sess.session_id, { branch: near.addr });
+        } catch (e) {}
+      }
+      return;
+    }
+
     if (msg.voice) {
       const fileUrl = await getTelegramFileUrl(msg.voice.file_id);
       if (!fileUrl) return;
@@ -1002,6 +1270,12 @@ app.post('/telegram-webhook', async (req, res) => {
     } else return;
 
     const isManager = String(chatId) === String(MANAGER_CHAT_ID);
+
+    // Быстрый вход в запись
+    if (!isManager && BRANCHES.length && /запис|свободн|хочу прийти|забронир|есть окн/i.test(text || '')) {
+      await startBooking(chatId);
+      return;
+    }
 
     if (text.startsWith('/start')) {
       const parts = text.split(' ');
@@ -1349,7 +1623,22 @@ app.post('/telegram-webhook', async (req, res) => {
     const reply = await askAI(text, history, chatSession.session_id);
     const newHistory = [...history, { role: 'user', content: text }, { role: 'assistant', content: reply }];
     await updateSession(chatSession.session_id, { history: newHistory.slice(-20) });
-    await sendTelegram(chatId, reply);
+    const asksBranch = BRANCHES.length && /адрес|филиал|где вы|где наход|как добрат|какой филиал/i.test(text || '');
+
+    if (asksBranch) {
+      // В Telegram не дублируем весь список текстом — показываем кнопки
+      const kb = [];
+      for (let i = 0; i < BRANCHES.length; i += 2) {
+        kb.push(BRANCHES.slice(i, i + 2).map((addr, j) => ({
+          text: addr.length > 34 ? addr.slice(0, 32) + '…' : addr,
+          callback_data: 'br_' + (i + j)
+        })));
+      }
+      await sendTelegram(chatId, 'У нас ' + BRANCHES.length + ' филиалов в Кемерово. Выберите ближайший:', kb);
+      if (BRANCHES_GEO.length) await sendLocationKeyboard(chatId);
+    } else {
+      await sendTelegram(chatId, reply);
+    }
   } catch (error) {
     console.log('Telegram error:', error);
   }
@@ -1384,7 +1673,7 @@ cron.schedule('0 4 * * 1', async () => {
 
 app.get('/crawl', async (req, res) => {
   try {
-    // Собираем все страницы сайта: карточки товаров, цены, описания
+    // Собираем несколько страниц сайта (главная + внутренние ссылки), а не только одну
     let pages = [];
     try {
       const mapRes = await fetch('https://api.firecrawl.dev/v2/map', {
@@ -1681,10 +1970,94 @@ async function createClientDirect(p) {
   const ownerId = owners[0]?.owner?.id || owners[0]?.id;
   if (!ownerId) throw new Error('Не удалось получить ownerId Render');
 
-  const prompt = `Ты — AI-администратор компании «${p.business_name}» (сайт ${p.site_url}).` +
-    ' Общайся как живой администратор: приветливо, коротко, по делу.' +
-    ' Отвечай ТОЛЬКО по информации из базы знаний ниже.' +
-    ' Если нужных данных там нет — скажи, что уточнишь у администратора, и предложи оставить имя и телефон.';
+  // Сначала читаем сайт клиента, чтобы промпт был по реальным фактам, а не по названию домена
+  let siteText = '';
+  try {
+    const sr = await fetch('https://api.firecrawl.dev/v2/scrape', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${process.env.FIRECRAWL_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: p.site_url, formats: ['markdown'], onlyMainContent: false })
+    });
+    const sd = await sr.json();
+    siteText = (sd.data?.markdown || '').slice(0, 6000);
+    console.log('prompt: прочитано сайта', siteText.length, 'символов');
+  } catch (e) { console.log('scrape for prompt error:', e.message); }
+
+  let prompt = '';
+  try {
+    const aiRes = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${process.env.OPENROUTER_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek/deepseek-chat',
+        temperature: 0.3,
+        max_tokens: 700,
+        messages: [{
+          role: 'user',
+          content: `Ниже текст сайта компании. Составь системный промпт (до 900 символов) для ИИ-администратора компании «${p.business_name}». ` +
+            'Включи: кто вы, чем занимаетесь, тон общения, ключевые услуги. ' +
+            'Обязательно: все факты (цены, адрес, телефон) брать только из текста сайта, ничего не выдумывать, ' +
+            'собирать имя и телефон для заявки. Без markdown и списков.\n\nТЕКСТ САЙТА:\n' +
+            (siteText || '(текст недоступен, используй только базу знаний)')
+        }]
+      })
+    });
+    const aiData = await aiRes.json();
+    prompt = (aiData.choices?.[0]?.message?.content || '').trim();
+  } catch (e) { console.log('prompt generation error:', e.message); }
+
+  if (!prompt || prompt.length < 80) {
+    prompt = `Ты — AI-администратор компании «${p.business_name}» (сайт ${p.site_url}).` +
+      ' Общайся как живой администратор: приветливо, коротко, по делу.' +
+      ' Отвечай ТОЛЬКО по информации из базы знаний ниже.' +
+      ' Если нужных данных там нет — скажи, что уточнишь у администратора, и предложи оставить имя и телефон.';
+  }
+
+  // Отдельный репозиторий под клиента: шаблон копируется из chat-bot-tilda
+  let repoUrl = 'https://github.com/chaknoris5000-glitch/chat-bot-tilda';
+  try {
+    const ghToken = process.env.MY_GITHUB_TOKEN || '';
+    const ghHeaders = { Authorization: `Bearer ${ghToken}`, Accept: 'application/vnd.github+json', 'User-Agent': 'dsh-agent' };
+
+    const repoRes = await fetch('https://api.github.com/user/repos', {
+      method: 'POST',
+      headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: `chat-bot-${p.client_id}`, private: false })
+    });
+
+    if (repoRes.ok) {
+      const repo = await repoRes.json();
+      repoUrl = repo.html_url;
+      const safeName = String(p.business_name).replace(/'/g, "\\'");
+
+      for (const f of ['server.js', 'package.json', 'crm.html', 'app.html']) {
+        const srcRes = await fetch(`https://api.github.com/repos/chaknoris5000-glitch/chat-bot-tilda/contents/${f}?ref=main`, { headers: ghHeaders });
+        if (!srcRes.ok) { console.log('copy skip', f, srcRes.status); continue; }
+        const srcMeta = await srcRes.json();
+        let content = Buffer.from(srcMeta.content, 'base64').toString('utf8');
+
+        if (f === 'server.js') {
+          content = content
+            .replace(/const CLIENT_ID = .*?;/, `const CLIENT_ID = '${p.client_id}';`)
+            .replace(/const BUSINESS_NAME = .*?;/, `const BUSINESS_NAME = '${safeName}';`)
+            .replace(/const SITE_TO_CRAWL = .*?;/, `const SITE_TO_CRAWL = '${p.site_url}';`)
+            .replace(/const BASE_URL = .*?;/, `const BASE_URL = '${p.site_url}';`);
+        } else {
+          content = content.replace(/const BOT_CLIENT_ID = .*?;/, `const BOT_CLIENT_ID = '${p.client_id}';`);
+        }
+
+        const putRes = await fetch(`https://api.github.com/repos/${repo.full_name}/contents/${f}`, {
+          method: 'PUT',
+          headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: `Add ${f}`, content: Buffer.from(content).toString('base64') })
+        });
+        if (!putRes.ok) console.log('copy fail', f, putRes.status, (await putRes.text()).slice(0, 120));
+      }
+      console.log('✅ репозиторий клиента создан:', repoUrl);
+    } else {
+      console.log('repo create failed:', repoRes.status, (await repoRes.text()).slice(0, 160));
+    }
+  } catch (e) { console.log('repo create error, используем общий репозиторий:', e.message); }
 
   const envMap = {
     CLIENT_ID: p.client_id,
@@ -1715,7 +2088,7 @@ async function createClientDirect(p) {
       type: 'web_service',
       name: `chat-bot-${p.client_id}`,
       ownerId,
-      repo: 'https://github.com/chaknoris5000-glitch/chat-bot-tilda',
+      repo: repoUrl,
       branch: 'main',
       autoDeploy: 'yes',
       envVars,
@@ -1810,12 +2183,22 @@ app.post('/api/create-client', async (req, res) => {
 // ========== CRM: правка заявок через сервер (без anon-доступа к базе) ==========
 app.post('/api/lead-update', async (req, res) => {
   try {
+    const uid = getRequesterId(req);
+    if (!uid) return res.status(401).json({ error: 'unauthorized' });
     const { id, db, patch, action } = req.body || {};
     if (!id) return res.status(400).json({ error: 'no id' });
     const useTilda = db === 'tilda';
     const baseUrl = useTilda ? SUPABASE_URL : COMMON_SUPABASE_URL;
     const baseKey = useTilda ? SUPABASE_KEY : COMMON_SUPABASE_KEY;
     const headers = { apikey: baseKey, Authorization: 'Bearer ' + baseKey };
+
+    const leadRes = await fetch(baseUrl + '/rest/v1/leads?id=eq.' + id + '&select=client_id', { headers });
+    const leadRows = await leadRes.json();
+    const leadClient = Array.isArray(leadRows) && leadRows[0] ? leadRows[0].client_id : null;
+    const allowedForUser = await ownedClientIds(uid);
+    if (!leadClient || (allowedForUser && !allowedForUser.includes(leadClient))) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
 
     if (action === 'delete') {
       const d = await fetch(baseUrl + '/rest/v1/leads?id=eq.' + id, { method: 'DELETE', headers });
@@ -1842,43 +2225,453 @@ app.post('/api/lead-update', async (req, res) => {
   }
 });
 
+
+// ========== БЭКАПЫ И МОНИТОРИНГ (только на центральном боте) ==========
+const BACKUP_BUCKET = 'backups';
+
+async function makeBackup() {
+  const tables = ['clients', 'documents', 'leads', 'chat_sessions'];
+  const dump = {};
+  for (const t of tables) {
+    const r = await fetch(`${COMMON_SUPABASE_URL}/rest/v1/${t}?select=*`, {
+      headers: { 'apikey': COMMON_SUPABASE_KEY, 'Authorization': `Bearer ${COMMON_SUPABASE_KEY}` }
+    });
+    dump[t] = await r.json();
+  }
+  const payload = JSON.stringify({ created_at: new Date().toISOString(), data: dump });
+  const name = `dump-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.json`;
+
+  const up = await fetch(`${COMMON_SUPABASE_URL}/storage/v1/object/${BACKUP_BUCKET}/${name}`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${COMMON_SUPABASE_KEY}`,
+      'apikey': COMMON_SUPABASE_KEY,
+      'Content-Type': 'application/json',
+      'x-upsert': 'true'
+    },
+    body: payload
+  });
+  const text = await up.text();
+  console.log('backup:', name, up.status, payload.length, 'bytes', up.ok ? '' : text.slice(0, 150));
+
+  // Бэкап второй базы (Tilda_bot) — там данные основного бота
+  let tildaOk = false;
+  try {
+    const tDump = {};
+    for (const t of tables) {
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/${t}?select=*`, {
+        headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+      });
+      tDump[t] = await r.json();
+    }
+    const tPayload = JSON.stringify({ created_at: new Date().toISOString(), data: tDump });
+    const tName = `tilda-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.json`;
+    const tUp = await fetch(`${COMMON_SUPABASE_URL}/storage/v1/object/${BACKUP_BUCKET}/${tName}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${COMMON_SUPABASE_KEY}`,
+        'apikey': COMMON_SUPABASE_KEY,
+        'Content-Type': 'application/json',
+        'x-upsert': 'true'
+      },
+      body: tPayload
+    });
+    tildaOk = tUp.ok;
+  } catch (e) { console.log('tilda backup error:', e.message); }
+
+  // Чистим бэкапы старше 14 дней
+  try {
+    const listRes = await fetch(`${COMMON_SUPABASE_URL}/storage/v1/object/list/${BACKUP_BUCKET}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${COMMON_SUPABASE_KEY}`,
+        'apikey': COMMON_SUPABASE_KEY,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ prefix: '', limit: 200, sortBy: { column: 'created_at', order: 'desc' } })
+    });
+    const items = await listRes.json();
+    const cutoff = Date.now() - 14 * 86400000;
+    let removed = 0;
+    for (const it of Array.isArray(items) ? items : []) {
+      if (new Date(it.created_at).getTime() < cutoff) {
+        await fetch(`${COMMON_SUPABASE_URL}/storage/v1/object/${BACKUP_BUCKET}/${it.name}`, {
+          method: 'DELETE',
+          headers: { 'Authorization': `Bearer ${COMMON_SUPABASE_KEY}`, 'apikey': COMMON_SUPABASE_KEY }
+        });
+        removed++;
+      }
+    }
+    if (removed) console.log('backup: удалено старых', removed);
+  } catch (e) { console.log('backup cleanup error:', e.message); }
+
+  return { ok: up.ok, name, bytes: payload.length, status: up.status, tildaOk };
+}
+
+cron.schedule('0 3 * * *', async () => {
+  if (CLIENT_ID !== 'tilda') return;
+  try { await makeBackup(); } catch (e) { console.log('backup error:', e.message); }
+});
+
+const __alerted = new Map();
+const __failCount = new Map();
+async function checkBots(alert = true) {
+  const r = await fetch(`${COMMON_SUPABASE_URL}/rest/v1/clients?select=client_id,business_name`, {
+    headers: { 'apikey': COMMON_SUPABASE_KEY, 'Authorization': `Bearer ${COMMON_SUPABASE_KEY}` }
+  });
+  const clients = await r.json();
+  const results = [];
+  for (const c of Array.isArray(clients) ? clients : []) {
+    if (!c.client_id || c.client_id === 'demo-client') continue;
+    const url = `https://chat-bot-${String(c.client_id).toLowerCase()}.onrender.com/health`;
+    let ok = false;
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(60000) });
+      ok = res.ok;
+    } catch (e) { ok = false; }
+
+    // Free-план Render «просыпается» до минуты — перепроверяем, прежде чем паниковать
+    if (!ok) {
+      await new Promise(r => setTimeout(r, 15000));
+      try {
+        const res2 = await fetch(url, { signal: AbortSignal.timeout(60000) });
+        ok = res2.ok;
+      } catch (e) { ok = false; }
+    }
+
+    const fails = (__failCount.get(c.client_id) || 0) + (ok ? 0 : 1);
+    __failCount.set(c.client_id, ok ? 0 : fails);
+    results.push({ client_id: c.client_id, ok, fails: __failCount.get(c.client_id) });
+    // Алерт только после двух провалов подряд (20 минут), чтобы не ловить холодный старт
+    if (!ok && alert && __failCount.get(c.client_id) >= 2) {
+      const last = __alerted.get(c.client_id) || 0;
+      if (Date.now() - last > 3600000) {
+        __alerted.set(c.client_id, Date.now());
+        try {
+          await sendTelegram(MANAGER_CHAT_ID, `⚠️ <b>Бот не отвечает</b>\n\nКлиент: ${c.business_name || c.client_id}\nСервис: ${url}`);
+        } catch (e) {}
+      }
+    }
+  }
+  return results;
+}
+
+cron.schedule('*/10 * * * *', async () => {
+  if (CLIENT_ID !== 'tilda') return;
+  try {
+    const res = await checkBots(true);
+    const bad = res.filter(x => !x.ok);
+    if (bad.length) console.log('watchdog: недоступны', bad.map(x => x.client_id).join(', '));
+  } catch (e) { console.log('watchdog error:', e.message); }
+});
+
+app.post('/api/backup-now', async (req, res) => {
+  const uid = getRequesterId(req);
+  if (String(uid) !== ADMIN_TG_ID) return res.status(403).json({ error: 'forbidden' });
+  try { res.json(await makeBackup()); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/watchdog-now', async (req, res) => {
+  const uid = getRequesterId(req);
+  if (String(uid) !== ADMIN_TG_ID) return res.status(403).json({ error: 'forbidden' });
+  try { res.json({ results: await checkBots(false) }); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ========== ЗАПИСЬ НА ВРЕМЯ, УСЛУГИ, ОТЗЫВЫ ==========
+const SERVICES = (() => {
+  try {
+    const a = JSON.parse(process.env.SERVICES || '[]');
+    return Array.isArray(a) ? a : [];
+  } catch (e) { return []; }
+})();
+const PROMOS = (() => {
+  try { const o = JSON.parse(process.env.PROMOS || '{}'); return o && typeof o === 'object' ? o : {}; }
+  catch (e) { return {}; }
+})();
+
+const PROMO_RULES = (() => {
+  try { const a = JSON.parse(process.env.PROMO_RULES || '[]'); return Array.isArray(a) ? a : []; }
+  catch (e) { return []; }
+})();
+const WORK_START = Number(process.env.WORK_START || 10);
+const WORK_END = Number(process.env.WORK_END || 20);
+const TZ_OFFSET = Number(process.env.TZ_OFFSET || 7);
+
+function pad2(n) { return String(n).padStart(2, '0'); }
+
+function buildSlots(count) {
+  const limit = count || 9;
+  const now = Date.now();
+  const local = new Date(now + TZ_OFFSET * 3600000);
+  const out = [];
+  for (let d = 0; d < 4 && out.length < limit; d++) {
+    for (let h = WORK_START; h < WORK_END && out.length < limit; h++) {
+      const ts = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate() + d, h - TZ_OFFSET, 0, 0);
+      if (ts < now + 3600000) continue;
+      out.push(ts);
+    }
+  }
+  return out;
+}
+
+function slotLabel(ts) {
+  const l = new Date(ts + TZ_OFFSET * 3600000);
+  const n = new Date(Date.now() + TZ_OFFSET * 3600000);
+  const dd = Math.round((Date.UTC(l.getUTCFullYear(), l.getUTCMonth(), l.getUTCDate()) - Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate())) / 86400000);
+  const day = dd === 0 ? 'сегодня' : (dd === 1 ? 'завтра' : pad2(l.getUTCDate()) + '.' + pad2(l.getUTCMonth() + 1));
+  return day + ' ' + pad2(l.getUTCHours()) + ':00';
+}
+
+async function sbInsertBooking(payload) {
+  const r = await fetch(COMMON_SUPABASE_URL + '/rest/v1/bookings', {
+    method: 'POST',
+    headers: { 'apikey': COMMON_SUPABASE_KEY, 'Authorization': 'Bearer ' + COMMON_SUPABASE_KEY, 'Content-Type': 'application/json', 'Prefer': 'return=representation' },
+    body: JSON.stringify(payload)
+  });
+  const rows = await r.json();
+  return Array.isArray(rows) ? rows[0] : null;
+}
+
+async function sbUpdateBooking(id, patch) {
+  await fetch(COMMON_SUPABASE_URL + '/rest/v1/bookings?id=eq.' + id, {
+    method: 'PATCH',
+    headers: { 'apikey': COMMON_SUPABASE_KEY, 'Authorization': 'Bearer ' + COMMON_SUPABASE_KEY, 'Content-Type': 'application/json', 'Prefer': 'return=minimal' },
+    body: JSON.stringify(patch)
+  });
+}
+
+async function getBookings(chatId) {
+  const r = await fetch(COMMON_SUPABASE_URL + '/rest/v1/bookings?client_id=eq.' + CLIENT_ID + '&telegram_chat_id=eq.' + chatId + '&order=slot.desc&limit=5', {
+    headers: { 'apikey': COMMON_SUPABASE_KEY, 'Authorization': 'Bearer ' + COMMON_SUPABASE_KEY }
+  });
+  const rows = await r.json();
+  return Array.isArray(rows) ? rows : [];
+}
+
+async function showSlots(chatId) {
+  const slots = buildSlots(9);
+  if (!slots.length) {
+    await sendTelegram(chatId, 'Свободных окон на ближайшие дни нет — напишите администратору.');
+    return;
+  }
+  const kb = slots.map(ts => [{ text: slotLabel(ts), callback_data: 'bk_' + ts }]);
+  kb.push([{ text: '👤 Позвать администратора', callback_data: 'mgr' }]);
+  await sendTelegram(chatId, 'Выберите удобное время:', kb);
+}
+
+async function showServices(chatId) {
+  if (!SERVICES.length) { await showSlots(chatId); return; }
+  const kb = SERVICES.map((s, i) => [{ text: s.name + (s.price ? ' — ' + s.price + '₽' : ''), callback_data: 'bs_' + i }]);
+  kb.push([{ text: 'Другое / не знаю', callback_data: 'bs_x' }]);
+  kb.push([{ text: '👤 Позвать администратора', callback_data: 'mgr' }]);
+  await sendTelegram(chatId, 'Что планируете делать?', kb);
+}
+
+async function startBooking(chatId) {
+  let sess = await getSessionByTelegram(chatId);
+  if (!sess) {
+    const sid = 'tg_' + chatId + '_' + CLIENT_ID;
+    await getOrCreateSession(sid);
+    await updateSession(sid, { telegram_chat_id: chatId });
+    sess = await getSessionByTelegram(chatId);
+  }
+  if (BRANCHES.length && !(sess && sess.branch)) {
+    const kb = [];
+    for (let i = 0; i < BRANCHES.length; i += 2) {
+      kb.push(BRANCHES.slice(i, i + 2).map((a, j) => ({ text: a.length > 34 ? a.slice(0, 32) + '…' : a, callback_data: 'bf_' + (i + j) })));
+    }
+    await sendTelegram(chatId, 'Выберите филиал:', kb);
+    return;
+  }
+  const prev = await getBookings(chatId);
+  if (prev.length && sess && sess.branch) {
+    await sendTelegram(chatId, 'Вы уже были у нас: ' + prev[0].branch + (prev[0].service ? ', ' + prev[0].service : '') + '.', [
+      [{ text: '🔁 Повторить прошлую запись', callback_data: 'agn' }],
+      [{ text: '🆕 Записаться по-новому', callback_data: 'new' }]
+    ]);
+    return;
+  }
+  await showServices(chatId);
+}
+
+async function repeatLastBooking(chatId) {
+  const prev = await getBookings(chatId);
+  if (!prev.length) { await showServices(chatId); return; }
+  const last = prev[0];
+  const sess = await getSessionByTelegram(chatId);
+  if (sess) await updateSession(sess.session_id, { branch: last.branch || sess.branch, service: last.service || null });
+  await sendTelegram(chatId, 'Повторяем: ' + (last.branch || '') + (last.service ? ', ' + last.service : '') + '.');
+  await showSlots(chatId);
+}
+
+async function confirmBooking(chatId, ts) {
+  const sess = await getSessionByTelegram(chatId);
+  const branch = sess && sess.branch ? sess.branch : '';
+  const service = sess && sess.service ? sess.service : '';
+  const svc = SERVICES.find(s => s.name === service);
+  const price = svc && svc.price ? svc.price : null;
+
+  await sbInsertBooking({
+    client_id: CLIENT_ID,
+    telegram_chat_id: chatId,
+    branch: branch || null,
+    service: service || null,
+    price: price,
+    slot: new Date(ts).toISOString(),
+    status: 'new'
+  });
+
+  await sendTelegram(chatId, 'Записал вас: <b>' + slotLabel(ts) + '</b>' +
+    (service ? ', ' + service : '') +
+    (branch ? '\nФилиал: ' + branch : '') +
+    '\n\nЖдём! Если планы изменятся — напишите.');
+
+  const promo = branch && PROMOS[branch];
+  if (promo) await sendTelegram(chatId, '🎁 ' + promo);
+
+  try {
+    const local = new Date(ts + TZ_OFFSET * 3600000);
+    const day = local.getUTCDay();
+    const hour = local.getUTCHours();
+    for (const rule of PROMO_RULES) {
+      const days = Array.isArray(rule.days) ? rule.days : [];
+      const okDay = !days.length || days.includes(day);
+      const okHour = (rule.from == null || hour >= rule.from) && (rule.to == null || hour < rule.to);
+      if (okDay && okHour && rule.text) { await sendTelegram(chatId, '🎁 ' + rule.text); break; }
+    }
+  } catch (e) {}
+
+  if (MANAGER_CHAT_ID) {
+    await sendTelegram(MANAGER_CHAT_ID, '📅 <b>Новая запись</b>\n\n' +
+      slotLabel(ts) +
+      (service ? '\nУслуга: ' + service : '') +
+      (branch ? '\nФилиал: ' + branch : '') +
+      '\nКлиент: ' + chatId);
+  }
+}
+
+cron.schedule('*/10 * * * *', async () => {
+  try {
+    const soon = new Date(Date.now() + 120 * 60000).toISOString();
+    const after = new Date(Date.now() + 60 * 60000).toISOString();
+    const r = await fetch(COMMON_SUPABASE_URL + '/rest/v1/bookings?client_id=eq.' + CLIENT_ID + '&reminded=eq.false&slot=gte.' + after + '&slot=lte.' + soon, {
+      headers: { 'apikey': COMMON_SUPABASE_KEY, 'Authorization': 'Bearer ' + COMMON_SUPABASE_KEY }
+    });
+    const rows = await r.json();
+    for (const b of Array.isArray(rows) ? rows : []) {
+      await sendTelegram(b.telegram_chat_id, 'Напоминаем: вы записаны на ' + slotLabel(new Date(b.slot).getTime()) +
+        (b.branch ? ' (' + b.branch + ')' : '') + '. Ждём вас!');
+      await sbUpdateBooking(b.id, { reminded: true });
+    }
+  } catch (e) { console.log('reminder cron error:', e.message); }
+});
+
+cron.schedule('*/15 * * * *', async () => {
+  try {
+    const past = new Date(Date.now() - 2 * 3600000).toISOString();
+    const limit = new Date(Date.now() - 7 * 86400000).toISOString();
+    const r = await fetch(COMMON_SUPABASE_URL + '/rest/v1/bookings?client_id=eq.' + CLIENT_ID + '&review_sent=eq.false&slot=lte.' + past + '&slot=gte.' + limit, {
+      headers: { 'apikey': COMMON_SUPABASE_KEY, 'Authorization': 'Bearer ' + COMMON_SUPABASE_KEY }
+    });
+    const rows = await r.json();
+    for (const b of Array.isArray(rows) ? rows : []) {
+      await sendTelegram(b.telegram_chat_id, 'Как всё прошло? Оцените визит:', [[
+        { text: '1', callback_data: 'rev_1_' + b.id },
+        { text: '2', callback_data: 'rev_2_' + b.id },
+        { text: '3', callback_data: 'rev_3_' + b.id },
+        { text: '4', callback_data: 'rev_4_' + b.id },
+        { text: '5', callback_data: 'rev_5_' + b.id }
+      ]]);
+      await sbUpdateBooking(b.id, { review_sent: true });
+    }
+  } catch (e) { console.log('review cron error:', e.message); }
+});
+
+
+app.get('/api/get-bookings', async (req, res) => {
+  try {
+    const uid = getRequesterId(req);
+    if (!uid) return res.status(401).json({ error: 'unauthorized' });
+    const { client_id } = req.query;
+    const allowed = await ownedClientIds(uid);
+    if (allowed && (!client_id || !allowed.includes(client_id))) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    const r = await fetch(COMMON_SUPABASE_URL + '/rest/v1/bookings?client_id=eq.' + client_id + '&order=slot.desc&limit=200', {
+      headers: { 'apikey': COMMON_SUPABASE_KEY, 'Authorization': 'Bearer ' + COMMON_SUPABASE_KEY }
+    });
+    res.json(await r.json());
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/booking-update', async (req, res) => {
+  try {
+    const uid = getRequesterId(req);
+    if (!uid) return res.status(401).json({ error: 'unauthorized' });
+    const { id, client_id, patch } = req.body || {};
+    if (!id || !client_id) return res.status(400).json({ error: 'no id' });
+    const allowed = await ownedClientIds(uid);
+    if (allowed && !allowed.includes(client_id)) return res.status(403).json({ error: 'forbidden' });
+    const body = {};
+    for (const k of ['status', 'rating', 'notes']) if (patch && Object.prototype.hasOwnProperty.call(patch, k)) body[k] = patch[k];
+    if (!Object.keys(body).length) return res.status(400).json({ error: 'empty patch' });
+    const r = await fetch(COMMON_SUPABASE_URL + '/rest/v1/bookings?id=eq.' + id + '&client_id=eq.' + client_id, {
+      method: 'PATCH',
+      headers: { 'apikey': COMMON_SUPABASE_KEY, 'Authorization': 'Bearer ' + COMMON_SUPABASE_KEY, 'Content-Type': 'application/json', 'Prefer': 'return=minimal' },
+      body: JSON.stringify(body)
+    });
+    if (!r.ok) throw new Error((await r.text()).slice(0, 200));
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
+// ========== ПОЧТА: отправка отчёта ==========
+let nodemailer = null;
+try { nodemailer = require('nodemailer'); } catch (e) { console.log('nodemailer не установлен'); }
+
+app.post('/api/send-report-email', async (req, res) => {
+  try {
+    const uid = getRequesterId(req);
+    if (!uid) return res.status(401).json({ error: 'unauthorized' });
+    const allowed = await ownedClientIds(uid);
+    if (allowed && !allowed.includes(CLIENT_ID)) return res.status(403).json({ error: 'forbidden' });
+    if (!nodemailer) return res.status(500).json({ error: 'nodemailer не установлен' });
+    if (!process.env.SMTP_HOST || !process.env.SMTP_USER) {
+      return res.status(400).json({ error: 'Почта не настроена: задайте SMTP_HOST, SMTP_USER, SMTP_PASS' });
+    }
+
+    const { email } = req.body || {};
+    const client = await getClient(CLIENT_ID);
+    const to = email || (client && client.email);
+    if (!to) return res.status(400).json({ error: 'Укажите email' });
+
+    const leads = await fetchLeads(null);
+    const buffer = await buildXlsx(leads, 'Отчёт');
+    const port = Number(process.env.SMTP_PORT || 465);
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: port,
+      secure: port === 465,
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+    });
+
+    await transporter.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: to,
+      subject: 'Заявки — ' + ((client && client.business_name) || CLIENT_ID),
+      text: 'Во вложении выгрузка заявок.',
+      attachments: [{ filename: 'leads.xlsx', content: buffer }]
+    });
+
+    res.json({ ok: true, to: to });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/health', (req, res) => {
   res.status(200).send('OK');
 });
-app.get('/fix-embeddings', async (req, res) => {
-  try {
-    const r = await fetch(`${COMMON_SUPABASE_URL}/rest/v1/documents?client_id=eq.${CLIENT_ID}&select=id,content,embedding`, {
-      headers: { 'apikey': COMMON_SUPABASE_KEY, 'Authorization': `Bearer ${COMMON_SUPABASE_KEY}` }
-    });
-    const docs = await r.json();
-    let fixed = 0;
 
-    for (const doc of docs) {
-      // Проверяем, если вектор пустой или строка из нулей
-      let isZero = false;
-      if (!doc.embedding) {
-        isZero = true;
-      } else if (typeof doc.embedding === 'string' && doc.embedding.startsWith('[0,0,0')) {
-        isZero = true;
-      } else if (Array.isArray(doc.embedding) && doc.embedding.every(v => v === 0)) {
-        isZero = true;
-      }
-
-      if (isZero) {
-        const emb = await getEmbedding(doc.content);
-        await fetch(`${COMMON_SUPABASE_URL}/rest/v1/documents?id=eq.${doc.id}`, {
-          method: 'PATCH',
-          headers: { 'apikey': COMMON_SUPABASE_KEY, 'Authorization': `Bearer ${COMMON_SUPABASE_KEY}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ embedding: emb })
-        });
-        fixed++;
-      }
-    }
-    res.send(`Готово! Исправлено строк: ${fixed}`);
-  } catch (e) {
-    res.status(500).send(`Ошибка: ${e.message}`);
-  }
-});
-app.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, () => {
   console.log(`Сервер запущен: http://localhost:${PORT}`);
 });
